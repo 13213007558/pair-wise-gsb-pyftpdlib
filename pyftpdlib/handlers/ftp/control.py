@@ -784,6 +784,8 @@ class FTPHandler(AsyncChat):
                     msg += "the user's root directory"
                     self.respond(f"550 {msg}.")
                     self.log_cmd(cmd, arg, 550, msg)
+                    if cmd in ("RNFR", "RNTO"):
+                        self._rnfr = None
                     return
 
             # check permission
@@ -793,6 +795,8 @@ class FTPHandler(AsyncChat):
                     msg = "Not enough privileges."
                     self.respond("550 " + msg)
                     self.log_cmd(cmd, arg, 550, msg)
+                    if cmd in ("RNFR", "RNTO"):
+                        self._rnfr = None
                     return
 
             # call the proper ftp_* method
@@ -2050,6 +2054,13 @@ class FTPHandler(AsyncChat):
     def ftp_RNFR(self, path):
         """Rename the specified (only the source name is specified
         here, see RNTO command)."""
+        # A new RNFR starts (or restarts) the two-phased rename, so
+        # drop any source path left over by a previous RNFR/RNTO
+        # sequence. Otherwise a RNFR that fails below (e.g. the path
+        # does not exist or it is the home directory) would leave a
+        # stale source in place, and a later RNTO could rename a file
+        # the client never successfully marked for renaming.
+        self._rnfr = None
         if not self.fs.lexists(path):
             self.respond("550 No such file or directory.")
         elif self.fs.realpath(path) == self.fs.realpath(self.fs.root):
