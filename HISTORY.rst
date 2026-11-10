@@ -50,6 +50,13 @@ Version: 2.2.1 - (IN DEVELOPMENT)
   (">>> starting FTP server <<<") on every call.
 * [ThreadedFTPServer, MultiprocessFTPServer] the server start
   (">>> starting FTP server on <address> <<<") was not logged.
+* [FTPHandler] ABOR received after a transfer command (STOR / RETR) but
+  before the data connection was established leaked the file handle of
+  the pending transfer, and the pending transfer could be attached to
+  the *next* data connection instead of the file it was opened for. The
+  pending transfer is now dropped on ABOR, its file handle is closed,
+  and ``on_incomplete_file_received()`` / ``on_incomplete_file_sent()``
+  is called.
 
 **Compatibility notes**
 

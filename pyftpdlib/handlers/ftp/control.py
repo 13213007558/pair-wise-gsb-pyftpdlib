@@ -1710,22 +1710,43 @@ class FTPHandler(AsyncChat):
 
     def ftp_ABOR(self, line):
         """Abort the current data transfer."""
-        # ABOR received while no data channel exists
+        # ABOR received while no data channel exists and no transfer
+        # is waiting for a data connection to be established.
         if (
             self._dtp_acceptor is None
             and self._dtp_connector is None
             and self.data_channel is None
+            and self._in_dtp_queue is None
+            and self._out_dtp_queue is None
         ):
             self.respond("225 No transfer to abort.")
             return
         else:
+            resp = "225 ABOR command successful; data channel closed."
             # a PASV or PORT was received but connection wasn't made yet
             if (
                 self._dtp_acceptor is not None
                 or self._dtp_connector is not None
             ):
                 self._shutdown_connecting_dtp()
-                resp = "225 ABOR command successful; data channel closed."
+
+            # A transfer command (e.g. STOR or RETR) was received but
+            # the data connection was never established, hence the
+            # transfer never started. Drop the pending file handle, or
+            # it would leak and get attached to the next data connection
+            # instead of the file it was opened for.
+            if self._in_dtp_queue is not None:
+                file, cmd = self._in_dtp_queue
+                self._in_dtp_queue = None
+                if file is not None:
+                    file.close()
+                    self.on_incomplete_file_received(file.name)
+            if self._out_dtp_queue is not None:
+                file = self._out_dtp_queue[2]
+                self._out_dtp_queue = None
+                if file is not None:
+                    file.close()
+                    self.on_incomplete_file_sent(file.name)
 
             # If a data transfer is in progress the server must first
             # close the data connection, returning a 426 reply to
@@ -1745,7 +1766,6 @@ class FTPHandler(AsyncChat):
                 else:
                     self.data_channel.close()
                     self.data_channel = None
-                    resp = "225 ABOR command successful; data channel closed."
         self.respond(resp)
 
         # --- authentication
