@@ -192,6 +192,207 @@ class TestDummyAuthorizer(PyftpdlibTestCase):
         if (os.name in ("nt", "ce")) or (sys.platform == "cygwin"):
             assert auth.has_perm(USER, "w", self.tempdir.upper())
 
+    def test_perm_resolution_default_is_first_match(self):
+        auth = DummyAuthorizer()
+        assert (
+            auth.perm_resolution
+            == DummyAuthorizer.PERM_RESOLUTION_FIRST_MATCH
+        )
+        with pytest.raises(ValueError, match="invalid perm_resolution"):
+            DummyAuthorizer(perm_resolution="bogus")
+
+    def test_most_specific_overrides_first_match_order(self):
+        # Two nested directories and two opposite permission sets.
+        # In first-match mode the first registered override wins for
+        # nested paths; in most-specific mode the deepest one always
+        # wins, regardless of registration order.
+        def build_legacy(order):
+            auth = DummyAuthorizer()
+            auth.add_user(USER, PASSWD, HOME, perm="elr")
+            rules = [
+                (self.tempdir, "w", True),
+                (self.subtempdir, "r", True),
+            ]
+            for directory, perm, recursive in (
+                rules if order == "outer-first" else reversed(rules)
+            ):
+                auth.override_perm(
+                    USER, directory, perm=perm, recursive=recursive
+                )
+            return auth
+
+        for order in ("outer-first", "inner-first"):
+            legacy = build_legacy(order)
+            # legacy mode depends on registration order
+            if order == "outer-first":
+                assert legacy.has_perm(USER, "w", self.subtempfile)
+                assert not legacy.has_perm(USER, "r", self.subtempfile)
+            else:
+                assert not legacy.has_perm(USER, "w", self.subtempfile)
+                assert legacy.has_perm(USER, "r", self.subtempfile)
+            # an override still applies outside the nested directory
+            assert legacy.has_perm(USER, "w", self.tempfile)
+            # no override applies to the home directory -> default perms
+            assert legacy.has_perm(USER, "r", HOME)
+            assert not legacy.has_perm(USER, "w", HOME)
+
+            specific = DummyAuthorizer(
+                perm_resolution=DummyAuthorizer.PERM_RESOLUTION_MOST_SPECIFIC
+            )
+            specific.add_user(USER, PASSWD, HOME, perm="elr")
+            rules = [
+                (self.tempdir, "w", True),
+                (self.subtempdir, "r", True),
+            ]
+            for directory, perm, recursive in (
+                rules if order == "outer-first" else reversed(rules)
+            ):
+                specific.override_perm(
+                    USER, directory, perm=perm, recursive=recursive
+                )
+            # deepest rule wins no matter the registration order
+            assert specific.has_perm(USER, "r", self.subtempdir)
+            assert specific.has_perm(USER, "r", self.subtempfile)
+            assert not specific.has_perm(USER, "w", self.subtempfile)
+            # outer rule still governs paths the inner rule doesn't reach
+            assert specific.has_perm(USER, "w", self.tempdir)
+            assert specific.has_perm(USER, "w", self.tempfile)
+            assert not specific.has_perm(USER, "r", self.tempfile)
+            # unmatched path falls back to the user default permissions
+            assert specific.has_perm(USER, "r", HOME)
+            assert not specific.has_perm(USER, "w", HOME)
+
+    def test_most_specific_non_recursive_scope(self):
+        # recursive=False: the override covers the directory itself and
+        # its direct files, but not subdirectories nor their contents.
+        auth = DummyAuthorizer(
+            perm_resolution=DummyAuthorizer.PERM_RESOLUTION_MOST_SPECIFIC
+        )
+        auth.add_user(USER, PASSWD, HOME, perm="elr")
+        auth.override_perm(USER, self.tempdir, perm="w")
+        assert auth.has_perm(USER, "w", self.tempdir)  # directory itself
+        assert auth.has_perm(USER, "w", self.tempfile)  # direct file
+        assert not auth.has_perm(
+            USER, "w", self.subtempdir
+        )  # subdirectory excluded
+        assert not auth.has_perm(
+            USER, "w", self.subtempfile
+        )  # nested file excluded
+        # default permissions still apply where the override doesn't
+        assert auth.has_perm(USER, "r", self.subtempfile)
+
+    def test_most_specific_mixed_recursive_and_non_recursive(self):
+        # A non-recursive outer rule and a recursive inner rule: the
+        # inner directory and its contents follow the inner rule while
+        # direct files of the outer directory follow the outer rule.
+        auth = DummyAuthorizer(
+            perm_resolution=DummyAuthorizer.PERM_RESOLUTION_MOST_SPECIFIC
+        )
+        auth.add_user(USER, PASSWD, HOME, perm="elr")
+        auth.override_perm(USER, self.tempdir, perm="w")
+        auth.override_perm(USER, self.subtempdir, perm="r", recursive=True)
+        assert auth.has_perm(USER, "w", self.tempfile)
+        assert not auth.has_perm(USER, "r", self.tempfile)
+        assert auth.has_perm(USER, "r", self.subtempdir)
+        assert auth.has_perm(USER, "r", self.subtempfile)
+        assert not auth.has_perm(USER, "w", self.subtempfile)
+
+    def test_most_specific_order_independent(self):
+        # Same nested allow/deny rules registered in both orders must
+        # produce identical results under the most-specific strategy.
+        def build(order):
+            auth = DummyAuthorizer(
+                perm_resolution=DummyAuthorizer.PERM_RESOLUTION_MOST_SPECIFIC
+            )
+            auth.add_user(USER, PASSWD, HOME, perm="elr")
+            rules = [
+                (self.tempdir, "elr", True),
+                (self.subtempdir, "elradfmwMT", True),
+            ]
+            for directory, perm, recursive in (
+                rules if order == "allow-outer" else reversed(rules)
+            ):
+                auth.override_perm(
+                    USER, directory, perm=perm, recursive=recursive
+                )
+            return auth
+
+        targets = [
+            HOME,
+            self.tempdir,
+            self.tempfile,
+            self.subtempdir,
+            self.subtempfile,
+        ]
+        perms = "elradfmwMT"
+        forward = build("allow-outer")
+        reversed_ = build("deny-outer")
+        for target in targets:
+            for perm in perms:
+                assert forward.has_perm(
+                    USER, perm, target
+                ) == reversed_.has_perm(USER, perm, target)
+
+    def test_most_specific_common_prefix_not_treated_as_parent(self):
+        # A directory sharing a string prefix but not a path component
+        # must never match; depth ranking uses path components.
+        prefix_dir = self.tempdir + "@"
+        os.mkdir(prefix_dir)
+        try:
+            auth = DummyAuthorizer(
+                perm_resolution=DummyAuthorizer.PERM_RESOLUTION_MOST_SPECIFIC
+            )
+            auth.add_user(USER, PASSWD, HOME, perm="elr")
+            auth.override_perm(USER, prefix_dir, perm="w", recursive=True)
+            assert not auth.has_perm(USER, "w", self.tempdir)
+            assert not auth.has_perm(USER, "w", self.tempfile)
+            assert auth.has_perm(USER, "w", prefix_dir)
+        finally:
+            os.rmdir(prefix_dir)
+
+    def test_most_specific_rule_replacement_keeps_resolution(self):
+        auth = DummyAuthorizer(
+            perm_resolution=DummyAuthorizer.PERM_RESOLUTION_MOST_SPECIFIC
+        )
+        auth.add_user(USER, PASSWD, HOME, perm="elr")
+        auth.override_perm(USER, self.tempdir, perm="w", recursive=True)
+        auth.override_perm(USER, self.subtempdir, perm="r", recursive=True)
+        # replace the inner rule; selection must still be depth based
+        auth.override_perm(
+            USER, self.subtempdir, perm="elradfmwMT", recursive=True
+        )
+        assert auth.has_perm(USER, "w", self.subtempfile)
+        assert auth.has_perm(USER, "r", self.subtempfile)
+        assert auth.has_perm(USER, "w", self.tempfile)
+        assert not auth.has_perm(USER, "r", self.tempfile)
+
+    if hasattr(os, "symlink"):
+
+        def test_most_specific_symlink_normalized_like_filesystem(self):
+            linkdir = os.path.abspath(self.get_testfn())
+            if os.path.realpath(linkdir) != linkdir:
+                self.skipTest("symlinks not allowed")
+            os.symlink(self.subtempdir, linkdir)
+            try:
+                auth = DummyAuthorizer(
+                    perm_resolution=(
+                        DummyAuthorizer.PERM_RESOLUTION_MOST_SPECIFIC
+                    )
+                )
+                auth.add_user(USER, PASSWD, HOME, perm="elr")
+                auth.override_perm(
+                    USER, self.subtempdir, perm="w", recursive=True
+                )
+                # reaching the same directory through the symlink must
+                # resolve to the rule stored for the real destination
+                link_file = os.path.join(
+                    linkdir, os.path.basename(self.subtempfile)
+                )
+                assert auth.has_perm(USER, "w", link_file)
+                assert auth.has_perm(USER, "w", linkdir)
+            finally:
+                os.remove(linkdir)
+
 
 class _SharedAuthorizerTests:
     """Tests valid for both UnixAuthorizer and WindowsAuthorizer for

@@ -252,6 +252,113 @@ installed. See `demo/win_ftpd.py`_.
     if __name__ == "__main__":
         main()
 
+.. _directory-permission-overrides:
+
+Directory permission overrides
+==============================
+
+:meth:`~pyftpdlib.authorizers.DummyAuthorizer.override_perm` attaches a
+permission set to a directory inside a user's home directory. Whether the
+override also reaches the contents of that directory depends on the
+*recursive* argument:
+
+- ``recursive=True``: the override applies to the directory itself, every
+  file and every subdirectory inside it, at any depth.
+- ``recursive=False`` (the default): the override applies only to the
+  directory itself and to the files it directly contains. It does not apply
+  to its subdirectories nor to anything nested in them.
+
+If no override applies to a target path, the user's default permissions
+(the ``perm`` argument of :meth:`~pyftpdlib.authorizers.DummyAuthorizer.add_user`)
+are used.
+
+Both the directory given to ``override_perm()`` and the path checked at
+command time are normalized with ``os.path.realpath()`` and
+``os.path.normcase()``, so symbolic links are resolved the same way the
+filesystem layer validates commands: an override registered through a path
+that contains a symlink is matched against the real destination of that
+symlink.
+
+Choosing how overlapping overrides are resolved
+-----------------------------------------------
+
+When two overridden directories are nested and both apply to the same path,
+the authorizer has to choose one. Two strategies are available through the
+``perm_resolution`` constructor argument:
+
+- ``"first-match"`` (the default and the historical behavior): the first
+  applicable override wins, depending on the order in which the overrides
+  were registered.
+- ``"most-specific"``: the deepest applicable override always wins, no
+  matter the registration order. Depth is computed from the normalized path
+  components, so path separators and directory names that merely share a
+  string prefix never affect the choice. Re-registering an override for an
+  existing directory only replaces that rule; it does not change the
+  resolution.
+
+.. code-block:: python
+
+    from pyftpdlib.authorizers import DummyAuthorizer
+
+    # Order-independent, depth-based resolution.
+    authorizer = DummyAuthorizer(perm_resolution="most-specific")
+
+Migrating away from order-dependent configuration
+-------------------------------------------------
+
+Consider an old configuration relying on the registration order of two
+nested overrides. The user is read-only by default; ``/srv/ftp/incoming``
+is made writable and the ``quarantine`` subdirectory is locked back to
+read-only.
+
+.. code-block:: python
+
+    # Old behavior: "first-match". The broad writable override had to be
+    # registered first, and the more specific read-only override second,
+    # for the quarantine restriction to take effect.
+    authorizer = DummyAuthorizer()
+    authorizer.add_user("user", "password", "/srv/ftp", perm="elr")
+    authorizer.override_perm("user", "/srv/ftp/incoming", "elradfmw",
+                             recursive=True)
+    authorizer.override_perm("user",
+                             "/srv/ftp/incoming/quarantine", "elr",
+                             recursive=True)
+
+Under ``"first-match"`` the outcome depends on that exact ordering:
+swapping the two calls would make the writable override win everywhere and
+the quarantine restriction would silently stop applying. With
+``"most-specific"`` the same two rules give the same result in either order,
+because the quarantine directory is deeper.
+
+.. code-block:: python
+
+    authorizer = DummyAuthorizer(perm_resolution="most-specific")
+    authorizer.add_user("user", "password", "/srv/ftp", perm="elr")
+    # These two calls can now appear in any order.
+    authorizer.override_perm("user",
+                             "/srv/ftp/incoming/quarantine", "elr",
+                             recursive=True)
+    authorizer.override_perm("user", "/srv/ftp/incoming", "elradfmw",
+                             recursive=True)
+
+Results that change when switching an existing, order-dependent setup to
+``"most-specific"``:
+
+- A path located under several overrides now follows the deepest override
+  instead of the one registered first. Any rule that only "won" because it
+  was inserted first is replaced by the more specific rule on nested paths.
+- In the example above, if the two calls used to be registered in the
+  opposite order, files under ``incoming/quarantine`` were previously
+  writable (the broad rule matched first); after the migration they become
+  read-only again.
+- Paths directly inside ``incoming`` but outside ``quarantine`` keep the
+  writable permissions, because the read-only override does not reach them.
+- Paths matched by no override (for example the rest of the home directory)
+  keep using the user's default permissions; that fallback is unchanged.
+- The non-recursive scope (``recursive=False``) is unchanged: such an
+  override still only covers the directory itself and its direct files,
+  never its subdirectories.
+
 .. _changing-the-concurrency-model:
 
 Changing the concurrency model

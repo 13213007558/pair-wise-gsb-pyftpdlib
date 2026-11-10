@@ -8,6 +8,12 @@ Version: 2.2.1 - (IN DEVELOPMENT)
 * 686: distribute wheel binaries, not only .tar.gz.
 * 689: Fix file existence check for certificate files
 * Add a SECURITY.md mechanism to report critical vulnerabilities.
+* [DummyAuthorizer] new optional ``perm_resolution="most-specific"`` mode
+  resolves overlapping directory permission overrides by selecting the
+  deepest applicable directory instead of relying on registration order;
+  the original ``"first-match"`` behavior remains the default. Paths are
+  now normalized with ``os.path.realpath()`` so symlinks are resolved
+  consistently with the filesystem authorization path.
 
 **Bug fixes**
 

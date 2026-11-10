@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
+from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.filesystems import AbstractedFS
 from pyftpdlib.handlers import DTPHandler
 from pyftpdlib.handlers import FTPHandler
@@ -46,6 +47,7 @@ from . import PyftpdlibTestCase
 from . import close_client
 from . import disable_log_warning
 from . import get_server_handler
+from . import reset_server_opts
 from . import safe_rmpath
 from . import touch
 
@@ -1683,6 +1685,194 @@ class TestTimeouts(PyftpdlibTestCase):
         with contextlib.closing(self.client.makeport()):
             with contextlib.closing(self.client.makeport()):
                 pass
+
+
+class TestFtpDirectoryOverrideDispatch(PyftpdlibTestCase):
+    """Verify that the "most-specific" override strategy is actually
+    enforced through the real FTP command dispatch (LIST, RETR, DELE,
+    RNFR/RNTO) and that swapping the registration order of nested
+    allow/deny rules does not change the result.
+
+    The handler is driven over a connected socketpair instead of a bound
+    listening socket: this exercises the genuine pre_process_command()
+    dispatch path (path translation, validpath(), permission gate and
+    the ftp_* filesystem methods) without needing to bind a local port.
+    """
+
+    class _NamedSocket(socket.socket):
+        """AF_UNIX socketpair endpoint reporting an AF_INET peer name,
+        so FTPHandler's getpeername() setup succeeds without a port.
+        """
+
+        def __init__(self, raw):
+            fd = os.dup(raw.fileno())
+            raw.close()
+            super().__init__(fileno=fd)
+
+        def getpeername(self):
+            return ("127.0.0.1", 12345)
+
+    class _FakeServer:
+        backlog = 5
+
+        def __init__(self):
+            self.ip_map = []
+            # only inspected for its family; never bound or listened on
+            self.socket = socket.socket(
+                socket.AF_INET, socket.SOCK_STREAM
+            )
+
+    def setUp(self):
+        super().setUp()
+        # Paths are created under HOME so the authorizer accepts the
+        # overrides and the filesystem layer keeps them inside the root.
+        self.outer = os.path.abspath(self.get_testfn())
+        self.inner = os.path.join(self.outer, self.get_testfn())
+        os.makedirs(self.inner)
+        self.handler = None
+        self.peer = None
+        self.loop = None
+        self.server = None
+
+    def tearDown(self):
+        if self.handler is not None:
+            self.handler.close()
+        if self.peer is not None:
+            self.peer.close()
+        if self.server is not None:
+            self.server.socket.close()
+        if self.loop is not None:
+            self.loop.close()
+        reset_server_opts()
+        super().tearDown()
+
+    def _start_handler(self, order):
+        authorizer = DummyAuthorizer(
+            perm_resolution=DummyAuthorizer.PERM_RESOLUTION_MOST_SPECIFIC
+        )
+        # The user is fully privileged by default; the outer override
+        # removes privileges, the nested one re-grants them.
+        authorizer.add_user(USER, PASSWD, HOME, perm="elradfmwMT")
+        rules = [
+            (self.outer, "e", True),
+            (self.inner, "elradfmwMT", True),
+        ]
+        for directory, perm, recursive in (
+            rules if order == "outer-first" else reversed(rules)
+        ):
+            authorizer.override_perm(
+                USER, directory, perm=perm, recursive=recursive
+            )
+        FTPHandler.authorizer = authorizer
+        raw, self.peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn = self._NamedSocket(raw)
+        self.loop = IOLoop.factory()
+        self.server = self._FakeServer()
+        self.handler = FTPHandler(
+            conn, self.server, ioloop=self.loop
+        )
+        self.handler.authenticated = True
+        self.handler.username = USER
+        self.handler.password = PASSWD
+        self.handler.fs = AbstractedFS(HOME, self.handler)
+
+    def _dispatch(self, line):
+        """Drive the real command dispatch and return the FTP reply."""
+        self.handler._last_response = ""
+        parts = line.split(" ", 1)
+        self.handler.pre_process_command(
+            line, parts[0].upper(), parts[1] if len(parts) > 1 else ""
+        )
+        return self.handler._last_response
+
+    def _ftp_path(self, fs_path):
+        return fs_path[len(os.path.realpath(HOME)) :]
+
+    def _run_all_commands(self, order):
+        """Exercise listing, reading, deleting and renaming against both
+        the restricted outer directory and the fully-permitted inner one.
+        """
+        outer_file = os.path.join(self.outer, self.get_testfn())
+        inner_file = os.path.join(self.inner, self.get_testfn())
+        touch(outer_file)
+        touch(inner_file)
+        self._start_handler(order)
+        try:
+            results = {}
+            # --- listing (l) ---
+            results["list_outer"] = self._dispatch(
+                "NLST " + self._ftp_path(self.outer)
+            )[:3]
+            results["list_inner"] = self._dispatch(
+                "NLST " + self._ftp_path(self.inner)
+            )[:3]
+            # --- reading (r); no data channel is open, so an accepted
+            # RETR queues the transfer and replies 150 ---
+            results["retr_outer"] = self._dispatch(
+                "RETR " + self._ftp_path(outer_file)
+            )[:3]
+            results["retr_inner"] = self._dispatch(
+                "RETR " + self._ftp_path(inner_file)
+            )[:3]
+            # --- renaming (f), exercised before deletion so the files
+            # still exist ---
+            outer_dest = outer_file + "-renamed"
+            inner_dest = inner_file + "-renamed"
+            results["rnfr_outer"] = self._dispatch(
+                "RNFR " + self._ftp_path(outer_file)
+            )[:3]
+            results["rnfr_inner"] = self._dispatch(
+                "RNFR " + self._ftp_path(inner_file)
+            )[:3]
+            # the inner RNFR armed a rename; complete it
+            results["rnto_inner"] = self._dispatch(
+                "RNTO " + self._ftp_path(inner_dest)
+            )[:3]
+            results["inner_rename_done"] = os.path.exists(inner_dest)
+            # --- deletion (d) ---
+            results["dele_outer_reply"] = self._dispatch(
+                "DELE " + self._ftp_path(outer_file)
+            )[:3]
+            results["dele_outer_kept"] = os.path.exists(outer_file)
+            # the renamed inner file is the one left to delete
+            results["dele_inner_reply"] = self._dispatch(
+                "DELE " + self._ftp_path(inner_dest)
+            )[:3]
+            results["dele_inner_removed"] = not os.path.exists(inner_dest)
+            return results
+        finally:
+            safe_rmpath(outer_file)
+            safe_rmpath(outer_dest)
+            safe_rmpath(inner_dest)
+
+    def test_dispatch_is_order_independent(self):
+        # Nested allow/deny rules registered in opposite orders must
+        # produce exactly the same observable command behavior.
+        forward = self._run_all_commands("outer-first")
+        self.handler.close()
+        self.peer.close()
+        self.server.socket.close()
+        self.loop.close()
+        self.handler = self.peer = self.loop = self.server = None
+        reversed_ = self._run_all_commands("inner-first")
+        assert forward == reversed_
+
+    def test_dispatch_enforces_most_specific_rules(self):
+        results = self._run_all_commands("outer-first")
+        # outer directory: listing/reading/deleting/renaming refused
+        assert results["list_outer"] == "550"
+        assert results["retr_outer"] == "550"
+        assert results["dele_outer_reply"] == "550"
+        assert results["dele_outer_kept"] is True
+        assert results["rnfr_outer"] == "550"
+        # inner directory: deepest rule grants full access
+        assert results["list_inner"] == "150"
+        assert results["retr_inner"] == "150"
+        assert results["dele_inner_reply"] == "250"
+        assert results["dele_inner_removed"] is True
+        assert results["rnfr_inner"] == "350"
+        assert results["rnto_inner"] == "250"
+        assert results["inner_rename_done"] is True
 
 
 class TestConfigurableOptions(PyftpdlibTestCase):

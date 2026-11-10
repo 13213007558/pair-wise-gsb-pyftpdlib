@@ -54,7 +54,42 @@ class DummyAuthorizer:
     read_perms = "elr"
     write_perms = "adfmwMT"
 
-    def __init__(self):
+    # When two directory overrides both apply to a target path, this
+    # strategy picks the first override registered (the historical
+    # behavior, kept for backwards compatibility).
+    PERM_RESOLUTION_FIRST_MATCH = "first-match"
+    # Strategy selecting the deepest (most specific) directory override
+    # that actually applies to the target path, regardless of the order
+    # in which overrides were registered.
+    PERM_RESOLUTION_MOST_SPECIFIC = "most-specific"
+    _PERM_RESOLUTION_STRATEGIES = (
+        PERM_RESOLUTION_FIRST_MATCH,
+        PERM_RESOLUTION_MOST_SPECIFIC,
+    )
+
+    def __init__(self, perm_resolution=PERM_RESOLUTION_FIRST_MATCH):
+        """Create a new authorizer.
+
+        - (str) perm_resolution: selects how overlapping directory
+          permission overrides (see override_perm()) are resolved when
+          more than one of them applies to the same target path:
+
+          - "first-match" (default): the first applicable override in
+            registration order wins, as stored in the "operms" table.
+            This is the historical behavior and is preserved to avoid
+            breaking existing configurations.
+          - "most-specific": among the overrides that actually apply to
+            the target path, the one registered for the deepest
+            directory wins; registration order is irrelevant. If no
+            override applies, the user's default permissions are used.
+        """
+        if perm_resolution not in self._PERM_RESOLUTION_STRATEGIES:
+            raise ValueError(
+                "invalid perm_resolution strategy "
+                f"{perm_resolution!r}; expected one of "
+                f"{', '.join(map(repr, self._PERM_RESOLUTION_STRATEGIES))}"
+            )
+        self.perm_resolution = perm_resolution
         self.user_table = {}
 
     def add_user(
@@ -130,7 +165,33 @@ class DummyAuthorizer:
         del self.user_table[username]
 
     def override_perm(self, username, directory, perm, recursive=False):
-        """Override permissions for a given directory."""
+        """Override permissions for a given directory.
+
+        The directory is normalized with os.path.realpath() and
+        os.path.normcase(), so symbolic links are resolved the same way
+        the filesystem layer does when checking commands: an override
+        registered for a path reached through a symlink is stored (and
+        later matched) against its real destination. Re-registering an
+        override for the same directory replaces the previous one
+        without changing the resolution order.
+
+        The recursive argument decides which targets the override
+        applies to:
+
+        - recursive=True: the override applies to the directory itself,
+          every file and subdirectory it contains, at any depth.
+        - recursive=False (default): the override applies only to:
+          * the directory itself;
+          * the files directly contained in the directory.
+          It does not apply to subdirectories nor to anything contained
+          in them.
+
+        When several overrides apply to the same target path, the
+        resolution strategy is the one configured through the
+        perm_resolution constructor argument: "first-match" keeps the
+        historical registration-order behavior while "most-specific"
+        selects the deepest applicable directory.
+        """
         self._check_permissions(username, perm)
         if not os.path.isdir(directory):
             raise ValueError(f"no such directory: {directory!r}")
@@ -192,22 +253,81 @@ class DummyAuthorizer:
 
         Expected perm argument is one of the following letters:
         "elradfmwMT".
+
+        The path is normalized with os.path.realpath() and
+        os.path.normcase() before matching, so symbolic links are
+        resolved exactly like the filesystem layer does when a command
+        is dispatched. Directory separators and directory names sharing
+        a common prefix never influence matching, which is based on the
+        normalized path components.
         """
         if path is None:
             return perm in self.user_table[username]["perm"]
 
-        path = os.path.normcase(path)
-        for dir in self.user_table[username]["operms"]:
-            operm, recursive = self.user_table[username]["operms"][dir]
-            if self._issubpath(path, dir):
-                if recursive:
-                    return perm in operm
-                if path == dir or (
-                    os.path.dirname(path) == dir and not os.path.isdir(path)
-                ):
-                    return perm in operm
+        path = os.path.normcase(os.path.realpath(path))
+        operms = self.user_table[username]["operms"]
+        if self.perm_resolution == self.PERM_RESOLUTION_MOST_SPECIFIC:
+            return perm in self._resolve_most_specific_perm(
+                username, path, operms
+            )
+        return perm in self._resolve_first_match_perm(path, operms, username)
 
-        return perm in self.user_table[username]["perm"]
+    def _resolve_first_match_perm(self, path, operms, username):
+        """Historical resolution: return the permission set of the first
+        registered override that applies to path, in dict insertion
+        order. Falls back to the user's default permissions.
+        """
+        for dir in operms:
+            operm, recursive = operms[dir]
+            if self._rule_applies(path, dir, recursive):
+                return operm
+        return self.user_table[username]["perm"]
+
+    def _resolve_most_specific_perm(self, username, path, operms):
+        """Return the permission set of the deepest override that
+        actually applies to path, ignoring registration order. Falls
+        back to the user's default permissions when no override applies.
+        """
+        selected = None
+        selected_depth = -1
+        for dir, (operm, recursive) in operms.items():
+            if self._rule_applies(path, dir, recursive):
+                depth = self._path_depth(dir)
+                if depth > selected_depth:
+                    selected = operm
+                    selected_depth = depth
+        if selected is None:
+            return self.user_table[username]["perm"]
+        return selected
+
+    def _rule_applies(self, path, dir, recursive):
+        """Whether an override registered for dir applies to path.
+
+        A recursive override applies to the directory itself and every
+        file or subdirectory nested inside it. A non-recursive override
+        applies only to the directory itself and to the files it
+        directly contains; subdirectories and their contents are
+        excluded.
+        """
+        if not self._issubpath(path, dir):
+            return False
+        if recursive:
+            return True
+        if path == dir:
+            return True
+        # A non-recursive override covers direct files only: the target
+        # must live directly inside the overridden directory and not be
+        # a directory itself.
+        return os.path.dirname(path) == dir and not os.path.isdir(path)
+
+    @staticmethod
+    def _path_depth(path):
+        """Number of path components, used to rank directory depth.
+        Comparing components instead of string length makes the result
+        independent of separators and of directory names sharing a
+        common prefix.
+        """
+        return len([part for part in path.split(os.sep) if part])
 
     def get_perms(self, username):
         """Return current user permissions."""

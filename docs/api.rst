@@ -38,7 +38,7 @@ Modules and classes hierarchy
 Users
 =====
 
-.. class:: pyftpdlib.authorizers.DummyAuthorizer()
+.. class:: pyftpdlib.authorizers.DummyAuthorizer(perm_resolution="first-match")
 
   Basic "dummy" authorizer class which lets you create virtual users.
   It is also  suitable for subclassing to create your own custom authorizer.
@@ -52,6 +52,20 @@ Users
   >>> authorizer = DummyAuthorizer()
   >>> authorizer.add_user('user', 'password', '/home/user', perm='elradfmwMT')
   >>> authorizer.add_anonymous('/home/nobody')
+
+  The *perm_resolution* constructor argument selects how overlapping
+  directory overrides (see :meth:`override_perm`) are resolved when more
+  than one of them applies to the same target path:
+
+  - ``"first-match"`` (default): the first applicable override, in the
+    order it was registered, wins. This is the historical behavior and is
+    kept so existing configurations keep working unchanged.
+  - ``"most-specific"``: among the overrides that actually apply to the
+    target path, the one registered for the deepest directory wins; the
+    registration order is ignored. When no override applies, the user's
+    default permissions are used.
+
+  Passing any other string raises ``ValueError``.
 
   .. method:: add_user(username, password, homedir, perm="elr", msg_login="Login successful.", msg_quit="Goodbye.")
 
@@ -89,6 +103,32 @@ Users
   .. method:: override_perm(username, directory, perm, recursive=False)
 
     Override user permissions for a specific directory.
+
+    *directory* is normalized with ``os.path.realpath()`` and
+    ``os.path.normcase()``: symbolic links are resolved exactly like the
+    filesystem layer does when dispatching a command, so an override reached
+    through a symlink is stored and matched against its real destination.
+    Re-registering an override for the same directory replaces the previous
+    one without affecting the resolution order.
+
+    The *recursive* argument defines the scope of the override:
+
+    - with ``recursive=True`` it applies to the directory itself, every file
+      and every subdirectory it contains, at any depth.
+    - with ``recursive=False`` (the default) it applies only to:
+
+      - the directory itself;
+      - the files directly contained in the directory.
+
+      It does **not** apply to subdirectories nor to anything they contain.
+
+    When several overrides apply to the same path, resolution follows the
+    *perm_resolution* strategy chosen at construction time: ``"first-match"``
+    keeps the historical registration-order behavior while
+    ``"most-specific"`` always selects the deepest applicable directory.
+    Paths matched by no override fall back to the user default permissions.
+    Matching is based on normalized path components, so path separators and
+    directory names sharing a common prefix never influence the result.
 
   .. method:: validate_authentication(username, password, handler)
 
